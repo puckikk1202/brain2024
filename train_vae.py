@@ -2,8 +2,8 @@ import torch
 import torch.nn as nn
 import numpy as np
 from dataset import EEGDataset
-from model.vit import ViT, SeqTransformer
-from model.eeg_mae import MAEforEEG, eeg_encoder
+from brain2024.model.vit import ViT, SeqTransformer
+from model.eeg_mae import MAEforEEG
 from torch.utils.data import DataLoader, Subset
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import StepLR
@@ -15,7 +15,7 @@ import wandb
 import matplotlib.pyplot as plt
 
     
-wandb.init(project="clip_2_eeg", entity="ohicarip")
+wandb.init(project="eeg_mae", entity="ohicarip")
 
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 data_dir = './datasets'
@@ -33,7 +33,7 @@ def log_image_to_wandb(data, inout="input", train_or_test='train', epoch=0):
     Returns:
     - None
     """
-    seq, ch = data.shape
+    ch, seq = data.shape
     
     # Plot the image
     fig = plt.figure(figsize=(15, 5))
@@ -59,7 +59,7 @@ def calc_vq_loss(pred, target, quant_loss, quant_loss_weight=1.0, alpha=1.0):
     return quant_loss * quant_loss_weight + rec_loss, [rec_loss, quant_loss]
 
 # Load the dataset
-eeg_dataset = EEGDataset(eeg_dir, anno_dir, is_clip=True, is_classification=True, is_all=True, is_staring=True, is_imagination=False)
+eeg_dataset = EEGDataset(eeg_dir, anno_dir, is_classification=False, is_all=True, is_staring=False, is_imagination=False)
 split_ratio = 0.8
 train_size = int(split_ratio * len(eeg_dataset))
 test_size = len(eeg_dataset) - train_size
@@ -70,15 +70,11 @@ test_indices = indices[train_size:]
 train_dataset = Subset(eeg_dataset, train_indices)
 test_dataset = Subset(eeg_dataset, test_indices)
 # train_dataset, test_dataset = torch.utils.data.split(eeg_dataset, [train_size, test_size])
-train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True)
-test_loader = DataLoader(test_dataset, batch_size=8, shuffle=False)
-print("train_set:", len(train_dataset), "test_set:", len(test_dataset))
+train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=16, shuffle=False)
+
 # Define the model
 # model = ViT(patch_size=64, emb_dim=768, num_classes=8).to(device)
-model = SeqTransformer(num_classes=8, ch=1024, seq_len=257).to(device)
-# model = eeg_encoder().to(device)
-# state_dict = torch.load('./checkpoints/mae/model_latest.pth')
-# model.load_checkpoint(state_dict)
 
 def get_parser():
     parser = argparse.ArgumentParser(description=' ')
@@ -101,8 +97,8 @@ def get_model(cfg):
     return model
 
 args = get_parser()
-vae = get_model(args).to(device)
-vae.load_state_dict(torch.load('./checkpoints/vae/model_latest.pth'))
+# model = get_model(args).to(device, dtype=torch.float32)
+model = MAEforEEG().to(device, dtype=torch.float32)
 # model = SeqTransformer(num_classes=8).to(device)
 optimizer = AdamW(model.parameters(), lr=1e-4)
 scheduler = StepLR(optimizer, step_size=10, gamma=0.1)
@@ -113,80 +109,77 @@ num_epochs = 100
 best_loss = float('inf')
 for epoch in range(num_epochs):
     model.train()
-    vae.eval()
     train_loss = 0.0
     correct = 0
     total = 0
-    for i, (eeg_sample, clip_feat, label) in enumerate(train_loader):
-        eeg_sample, clip_feat, label = eeg_sample.to(device, dtype=torch.float32), clip_feat.to(device, dtype=torch.float32), label.to(device, dtype=torch.float32)
+    for i, eeg_sample in enumerate(train_loader):
+        eeg_sample = eeg_sample.to(device, dtype=torch.float32) # [batch, ch, seq]
         optimizer.zero_grad()
         # output = model(eeg_sample)
         # loss = criterion(output, label)
-        eeg_sample = eeg_sample.permute(0, 2, 1)
-        clip_feat = clip_feat.permute(0, 2, 1)
-        output = model(clip_feat)
-        # eeg_feat, _, _ = vae(eeg_sample)
-        # output = model(eeg_feat)
-        # output = model(eeg_sample)
-        loss = criterion(output, label)
+
+        eeg_sample = eeg_sample.permute(0, 2, 1) # [batch, seq, ch]
+        # out, quant_loss, _ = model(eeg_sample)
+        # loss, loss_detail = calc_vq_loss(out, eeg_sample, quant_loss)
+        loss, out, _ = model(eeg_sample)
 
         if i % 100 == 0:
-            log_image_to_wandb(eeg_sample[0].cpu().detach().numpy(), epoch=epoch, inout="input", train_or_test='train')
-            # log_image_to_wandb(eeg_feat[0].cpu().detach().numpy(), epoch=epoch, inout="feature", train_or_test='train')
+            eeg_sample = eeg_sample.permute(0, 2, 1)
+            out = out.permute(0, 2, 1)
+            log_image_to_wandb(eeg_sample[0].cpu().detach().numpy(), epoch=epoch+1, inout="input", train_or_test='train')
+            log_image_to_wandb(out[0].cpu().detach().numpy(), epoch=epoch+1, inout="output", train_or_test='train')
 
         loss.backward()
         optimizer.step()
         
         train_loss += loss.item()
 
-        _, predicted = output.max(1)
-        _, label = label.max(1)
-        total += label.size(0)
+        # _, predicted = output.max(1)
+        # _, label = label.max(1)
+        # total += label.size(0)
         # print(label.shape, predicted.shape, label, predicted)
-        correct += predicted.eq(label).sum().item()
+        # correct += predicted.eq(label).sum().item()
     
-    train_accuracy = 100 * (correct / total)
+    # train_accuracy = 100 * (correct / total)
     train_loss /= len(train_loader)
     # Validation loop
     model.eval()
-    vae.eval()
     test_loss = 0.0
     correct = 0
     total = 0
     
     with torch.no_grad():
-        for i, (eeg_sample, clip_feat, label) in enumerate(test_loader):
-            eeg_sample, clip_feat, label = eeg_sample.to(device, dtype=torch.float32), clip_feat.to(device, dtype=torch.float32), label.to(device, dtype=torch.float32)
+        for i, eeg_sample in enumerate(test_loader):
+            eeg_sample = eeg_sample.to(device, dtype=torch.float32)
             # output = model(eeg_sample)
             # loss = criterion(output, label)
             eeg_sample = eeg_sample.permute(0, 2, 1)
-            clip_feat = clip_feat.permute(0, 2, 1)
-            output = model(clip_feat)
-            # eeg_feat, _, _ = vae(eeg_sample)
-            # output = model(eeg_feat)
-            # output = model(eeg_sample)
-            loss = criterion(output, label)
-
+            # out, quant_loss, _ = model(eeg_sample)
+            # loss, loss_detail = calc_vq_loss(out, eeg_sample, quant_loss)
+            loss, out, _ = model(eeg_sample)
+            
             if i % 10 == 0:
-                log_image_to_wandb(eeg_sample[0].cpu().detach().numpy(), epoch=epoch, inout="input", train_or_test='test')
-                # log_image_to_wandb(eeg_feat[0].cpu().detach().numpy(), epoch=epoch, inout="feature", train_or_test='test')
+                eeg_sample = eeg_sample.permute(0, 2, 1)
+                out = out.permute(0, 2, 1)
+                log_image_to_wandb(eeg_sample[0].cpu().detach().numpy(), epoch=epoch+1, inout="input", train_or_test='test')
+                log_image_to_wandb(out[0].cpu().detach().numpy(), epoch=epoch+1, inout="output", train_or_test='test')
             
             test_loss += loss.item()
-            _, predicted = output.max(1)
-            _, label = label.max(1)
-            total += label.size(0)
-            correct += predicted.eq(label).sum().item()
+            # _, predicted = output.max(1)
+            # predicted = torch.nn.functional.one_hot(predicted, num_classes=8)
+            # _, label = label.max(1)
+            # total += label.size(0)
+            # correct += predicted.eq(label).sum().item()
         
-    test_accuracy = 100 * (correct / total)
+    # test_accuracy = 100 * (correct / total)
     test_loss /= len(test_loader)
     if epoch > 30 and test_loss < best_loss:
         best_loss = test_loss
-        print(f'best model saved at epoch {epoch}.')
-        torch.save(model.state_dict(), './checkpoints/vit/model_best.pth')
-    torch.save(model.state_dict(), './checkpoints/vit/model_latest.pth')
+        print(f'best model saved at epoch {epoch+1}.')
+        torch.save(model.state_dict(), './checkpoints/mae/model_best.pth')
+    torch.save(model.state_dict(), './checkpoints/mae/model_latest.pth')
 
-    # print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Test Loss: {test_loss:.4f}')
+    print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Test Loss: {test_loss:.4f}')
     wandb.log({'train_loss': train_loss, 'test_loss': test_loss})
-    wandb.log({'train_accuracy': train_accuracy, 'test_accuracy': test_accuracy})
-    print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Train Acc: {train_accuracy:.2f}%, Test Loss: {test_loss:.4f}, Test Acc: {test_accuracy:.2f}%')
+    # print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Train Acc: {train_accuracy:.2f}%, Test Loss: {test_loss:.4f}, Test Acc: {test_accuracy:.2f}%')
     scheduler.step()

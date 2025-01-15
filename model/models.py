@@ -137,6 +137,64 @@ class PatchEmbed1D(nn.Module):
         x = self.proj(x).transpose(1, 2).contiguous() # put embed_dim at the last dimension
         return x
 
+class SeqTransformer(nn.Module):
+    def __init__(self, ch=64, seq_len=96, emb_dim=512, num_layers=6, num_heads=8, mlp_dim=768, num_classes=8, dropout=0.5):
+        super(SeqTransformer, self).__init__()
+        self.embedding = nn.Linear(ch, emb_dim)  # Project channels to embedding dimension
+        
+        self.transformer_layers = nn.ModuleList([
+            TransformerBlock(emb_dim, num_heads, mlp_dim, dropout) for _ in range(num_layers)
+        ])
+        
+        self.pos_embedding = nn.Parameter(torch.randn(1, seq_len, emb_dim))
+        self.dropout = nn.Dropout(dropout)
+        
+        self.mlp_head = nn.Sequential(
+            nn.LayerNorm(emb_dim),
+            nn.Linear(emb_dim, num_classes)
+        )
+    
+    def forward(self, x):
+        # x shape: (batch_size, ch=64, seq_len=1536)
+        x = x.to(dtype=torch.float32)
+        batch_size, ch, seq_len = x.shape
+        
+        # Linear projection of channels, reshape to (seq_len, batch_size, emb_dim)
+        x = x.permute(0, 2, 1)  # Change to (batch_size, seq_len, ch)
+        x = self.embedding(x)    # Apply embedding to (batch_size, seq_len, emb_dim)
+        # x = x + self.pos_embedding  # Add position embedding
+        x = self.dropout(x)
+        
+        # Transformer processing: (seq_len, batch_size, emb_dim)
+        x = x.permute(1, 0, 2)
+        for layer in self.transformer_layers:
+            x = layer(x)
+        
+        # Classification head: Take the output of the last token
+        x = x.permute(1, 0, 2)  # Back to (batch_size, seq_len, emb_dim)
+        cls_output = x.mean(dim=1)  # Pool over sequence dimension
+        out = self.mlp_head(cls_output)
+        return out
+
+class ProjectionHead(nn.Module):
+    def __init__(self, embedding_dim: int, projection_dim: int, dropout: float) -> None:
+        super().__init__()
+
+        self.projection = nn.Linear(embedding_dim, projection_dim)
+        self.gelu = nn.GELU()
+        self.fc = nn.Linear(projection_dim, projection_dim)
+
+        self.dropout = nn.Dropout(dropout)
+        self.layer_norm = nn.LayerNorm(projection_dim)
+
+    def forward(self, x):
+        projected = self.projection(x)
+        x = self.gelu(projected)
+        x = self.fc(x)
+        x = self.dropout(x)
+        x += projected
+        return self.layer_norm(x)
+
 class eeg_encoder(nn.Module):
     def __init__(self, time_len=1536, patch_size=4, embed_dim=1024, in_chans=64,
                  depth=24, num_heads=16, mlp_ratio=1., norm_layer=nn.LayerNorm, global_pool=False):
@@ -221,243 +279,19 @@ class eeg_encoder(nn.Module):
             state_dict = {k: v for k, v in state_dict.items() if ('mask_token' not in k and 'norm' not in k)}
         else:
             state_dict = {k: v for k, v in state_dict.items() if ('mask_token' not in k)}
-        ut.interpolate_pos_embed(self, state_dict)
+        u.interpolate_pos_embed(self, state_dict)
             
         m, u = self.load_state_dict(state_dict, strict=False)
         print('missing keys:', u)
         print('unexpected keys:', m)
         return 
 
-class SeqTransformer(nn.Module):
-    def __init__(self, ch=64, seq_len=96, emb_dim=512, num_layers=6, num_heads=8, mlp_dim=768, num_classes=8, dropout=0.3):
-        super(SeqTransformer, self).__init__()
-        self.embedding = nn.Linear(ch, emb_dim)  # Project channels to embedding dimension
-        
-        self.transformer_layers = nn.ModuleList([
-            TransformerBlock(emb_dim, num_heads, mlp_dim, dropout) for _ in range(num_layers)
-        ])
-        
-        self.pos_embedding = nn.Parameter(torch.randn(1, seq_len, emb_dim))
-        self.dropout = nn.Dropout(dropout)
-        
-        self.mlp_head = nn.Sequential(
-            nn.LayerNorm(emb_dim),
-            nn.Linear(emb_dim, num_classes)
-        )
-    
-    def forward(self, x):
-        # x shape: (batch_size, ch=64, seq_len=1536)
-        x = x.to(dtype=torch.float32)
-        batch_size, ch, seq_len = x.shape
-        
-        # Linear projection of channels, reshape to (seq_len, batch_size, emb_dim)
-        x = x.permute(0, 2, 1)  # Change to (batch_size, seq_len, ch)
-        x = self.embedding(x)    # Apply embedding to (batch_size, seq_len, emb_dim)
-        # x = x + self.pos_embedding  # Add position embedding
-        x = self.dropout(x)
-        
-        # Transformer processing: (seq_len, batch_size, emb_dim)
-        x = x.permute(1, 0, 2)
-        for layer in self.transformer_layers:
-            x = layer(x)
-        
-        # Classification head: Take the output of the last token
-        x = x.permute(1, 0, 2)  # Back to (batch_size, seq_len, emb_dim)
-        cls_output = x.mean(dim=1)  # Pool over sequence dimension
-        out = self.mlp_head(cls_output)
-        return out
-
-class ProjectionHead(nn.Module):
-    def __init__(self, embedding_dim: int, projection_dim: int, dropout: float) -> None:
-        super().__init__()
-
-        self.projection = nn.Linear(embedding_dim, projection_dim)
-        self.gelu = nn.GELU()
-        self.fc = nn.Linear(projection_dim, projection_dim)
-
-        self.dropout = nn.Dropout(dropout)
-        self.layer_norm = nn.LayerNorm(projection_dim)
-
-    def forward(self, x):
-        projected = self.projection(x)
-        x = self.gelu(projected)
-        x = self.fc(x)
-        x = self.dropout(x)
-        x += projected
-        return self.layer_norm(x)
-
-class EEGEncoder(nn.Module):
-    def __init__(self, num_classes=8, dropout=0.5, trainable=True):
-        super(EEGEncoder, self).__init__()
-        self.model = timm.create_model(
-            'vit_base_patch16_224_in21k',
-            pretrained=True,
-            num_classes=0,
-            global_pool="avg",
-            img_size=(64, 1536),
-        )
-
-        for param in self.model.parameters():
-            param.requires_grad = trainable
-
-        self.motion_projection = ProjectionHead(
-            embedding_dim=768,
-            projection_dim=256,
-            dropout=0.5,
-        )
-
-        self.mlp_head = nn.Sequential(
-            nn.LayerNorm(256),
-            nn.Linear(256, 8)
-        )
-    
-    def forward(self, x):
-        x = x.repeat(1, 3, 1, 1)
-        x = self.model(x)
-        x = self.motion_projection(x)
-        x = self.mlp_head(x)
-        return x
-
-class cnn_classifier(nn.Module):
-    def __init__(self, num_classes=2, is_clip=False):
-        super().__init__()
-        self.mca1 = LearnableMCAWithSelfAttention()
-        self.mca2 = LearnableMCAWithSelfAttention()
-        self.mca3 = LearnableMCAWithSelfAttention()
-        self.mca4 = LearnableMCAWithSelfAttention()
-        self.mca5 = LearnableMCAWithSelfAttention()
-        # 第一组卷积层和池化层
-        self.conv11 = nn.Conv3d(in_channels=1, out_channels=32, kernel_size=(3, 3, 3), stride=1, padding=(1, 1, 1))
-        self.conv12 = nn.Conv3d(in_channels=32, out_channels=32, kernel_size=(3, 3, 3), stride=1, padding=(1, 1, 1))
-        self.pool1 = nn.MaxPool3d(kernel_size=(1, 2, 2), stride=(1, 2, 2), padding=(0, 1, 1))
-
-        # 第二组卷积层和池化层
-        self.conv21 = nn.Conv3d(in_channels=32, out_channels=64, kernel_size=(3, 3, 3), stride=1, padding=(1, 1, 1))
-        self.conv22 = nn.Conv3d(in_channels=64, out_channels=64, kernel_size=(3, 3, 3), stride=1, padding=(1, 1, 1))
-        self.pool2 = nn.MaxPool3d(kernel_size=(1, 2, 1), stride=(1, 2, 1), padding=0)
-
-        # 修改全连接层的输入大小
-        self.is_clip = is_clip
-        if self.is_clip:
-            self.trans_warp = TransformerMapper()
-        else:
-            self.fc_layer = nn.Linear(64 *64 * 1 * 2, num_classes)
-            self.dropout_layer = nn.Dropout(p=0.3)
-
-    def forward(self, x1, x2):
-        x1, x2 = x1.transpose(1, 3), x2.transpose(1, 3)
-        x = torch.zeros((5, x1.size(0), 3, 64), device=x1.device)
-        for i in range(5):
-            x[i] = self.mca1(x1[:,:,i,:], x2[:,:,i,:])
-        x = x.permute(1, 3, 0, 2).unsqueeze(1)
-
-        h1 = F.relu(self.conv11(x))
-        h1 = F.relu(self.conv12(h1))
-        h1 = self.pool1(h1)
-
-
-        h2 = F.relu(self.conv21(h1))
-        h2 = F.relu(self.conv22(h2))
-        h2 = self.pool2(h2)
-
-        if self.is_clip:
-            h2 = h2.view(h2.size(0), 64, -1).transpose(1, 2)
-            out = self.trans_warp(h2)
-        else:
-            flatten = h2.view(h2.size(0), -1)
-            out = self.fc_layer(flatten)
-        return out
-
-class LearnableMCAWithSelfAttention(nn.Module):
-    def __init__(self, in_dim=64, feature_dim=64, out_dim=64, num_heads=4):
-        super(LearnableMCAWithSelfAttention, self).__init__()
-        
-        # 定义 Q, K, V 的线性变换用于 Cross-Attention
-        self.query_proj = nn.Linear(in_dim, feature_dim)
-        self.key_proj = nn.Linear(in_dim, feature_dim)
-        self.value_proj = nn.Linear(in_dim, feature_dim)
-        
-        # Cross-Attention
-        self.cross_attention = nn.MultiheadAttention(embed_dim=feature_dim, num_heads=num_heads, batch_first=True)
-        
-        # Self-Attention
-        self.self_attention = nn.MultiheadAttention(embed_dim=feature_dim, num_heads=num_heads, batch_first=True)
-        
-        # 可选的归一化层和残差连接
-        self.norm1 = nn.LayerNorm(feature_dim)
-        self.norm2 = nn.LayerNorm(feature_dim)
-        
-    def forward(self, de_features, psd_features):
-        """
-     
-        - de_features: DE  (batch_size, seq_len, feature_dim)
-        - psd_features: PSD  (batch_size, seq_len, feature_dim)
-        
- 
-        - fused_features:  (batch_size, seq_len, feature_dim)
-        """
-        # Cross-Attention: 
-        Q = self.query_proj(de_features)
-        K = self.key_proj(psd_features)
-        V = self.value_proj(psd_features)
-        
-        cross_attention_output, _ = self.cross_attention(Q, K, V)
-        
-
-        cross_attention_output = self.norm1(cross_attention_output + de_features)
-        
-        self_attention_output, _ = self.self_attention(cross_attention_output, cross_attention_output, cross_attention_output)
-        
-        fused_features = self.norm2(self_attention_output + cross_attention_output)
-        
-        return fused_features
-
-class TransformerMapper(nn.Module):
-    def __init__(self, input_dim=64, hidden_dim=1024, num_tokens=257, nhead=8, num_layers=4):
-        super(TransformerMapper, self).__init__()
-        
-        self.input_proj = nn.Linear(input_dim, hidden_dim)
-        
-        encoder_layer = nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=nhead)
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        
-        self.cls_token = nn.Parameter(torch.randn(1, 1, hidden_dim))
-        
-        self.position_embeddings = nn.Parameter(torch.randn(num_tokens, hidden_dim))
-        
-    def forward(self, x):
-        """
-        - x: (batch_size, 128, 64)
-        
-        -  (batch_size, 257, 1280)
-        """
-        batch_size, seq_len, _ = x.size()
-        
-        x = self.input_proj(x)  # (batch_size, 128, 1280)
-        
-        cls_tokens = self.cls_token.expand(batch_size, -1, -1)  # (batch_size, 1, 1280)
-        x = torch.cat((cls_tokens, x), dim=1)  # (batch_size, 129, 1280)
-        
-        if x.size(1) < 257:
-            padding_embeddings = self.position_embeddings[129:257].expand(batch_size, -1, -1)
-            x = torch.cat((x, padding_embeddings), dim=1)
-        
-        x = x + self.position_embeddings[:257].unsqueeze(0)  # (batch_size, 257, 1280)
-        
-        # Step 4: Transformer Encoder
-        x = x.permute(1, 0, 2)  # (seq_len, batch_size, hidden_dim) for Transformer input
-        x = self.transformer_encoder(x)  # (257, batch_size, 1280)
-        x = x.permute(1, 0, 2)  # 转回到 (batch_size, 257, 1280)
-        
-        return x
-
 # # Example usage
 if __name__=='__main__':
     batch_size = 16
-    input_tensor = torch.randn(batch_size, 64, 5, 3)
-    # model = ViT(patch_size=32, emb_dim=768, num_classes=8)
-    model = cnn_classifier(is_clip=True)
+    input_tensor = torch.randn(batch_size, 64, 1536)
+    model = ViT(patch_size=32, emb_dim=768, num_classes=8)
     # model = EEGEncoder()    
 
-    output = model(input_tensor, input_tensor)
+    output = model(input_tensor)
     print(output.shape)  # Expected output shape: (batch_size, num_classes)
